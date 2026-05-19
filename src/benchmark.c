@@ -43,13 +43,15 @@ int main(int argc, char *argv[]) {
     double row_time = (t1.tv_sec - t0.tv_sec) * 1000.0
                     + (t1.tv_nsec - t0.tv_nsec) / 1e6;
 
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    /*clock_gettime(CLOCK_MONOTONIC, &t0);
     column_comp(mat, res, size);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double col_time = (t1.tv_sec - t0.tv_sec) * 1000.0
-                    + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+                    + (t1.tv_nsec - t0.tv_nsec) / 1e6;*/
 
-    printf("%d,%.3f,%.3f\n", size, row_time, col_time);
+    printf("Size = %d, row_time = %.3f", size, row_time);
+
+    //printf("Size = %d,row_time = %.3f, col_time = %.3f\n", size, row_time, col_time);
 
     free(mat);
     free(res);
