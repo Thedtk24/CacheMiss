@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <math.h>
+#include <string.h>
 
 void row_comp(int *mat, double *res, int size) {
     for(int i = 0; i < size; i++)
@@ -16,8 +17,8 @@ void column_comp(int *mat, double *res, int size) {
 }
 
 int main(int argc, char *argv[]) {
-    if(argc < 2) {
-        printf("Usage : %s <SIZE>\n", argv[0]);
+    if(argc < 3) {
+        printf("Usage : %s <SIZE> <row|col>\n", argv[0]);
         exit(EXIT_FAILURE);
     }
 
@@ -37,21 +38,20 @@ int main(int argc, char *argv[]) {
 
     struct timespec t0, t1;
 
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    row_comp(mat, res, size);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    double row_time = (t1.tv_sec - t0.tv_sec) * 1000.0
-                    + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    if(strcmp(argv[2], "row") == 0) {
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        row_comp(mat, res, size);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+    } else {
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        column_comp(mat, res, size);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+    }
 
-    /*clock_gettime(CLOCK_MONOTONIC, &t0);
-    column_comp(mat, res, size);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    double col_time = (t1.tv_sec - t0.tv_sec) * 1000.0
-                    + (t1.tv_nsec - t0.tv_nsec) / 1e6;*/
+    double elapsed = (t1.tv_sec - t0.tv_sec) * 1000.0
+                   + (t1.tv_nsec - t0.tv_nsec) / 1e6;
 
-    printf("Size = %d, row_time = %.3f", size, row_time);
-
-    //printf("Size = %d,row_time = %.3f, col_time = %.3f\n", size, row_time, col_time);
+    printf("%s %d: %.3f ms\n", argv[2], size, elapsed);
 
     free(mat);
     free(res);
