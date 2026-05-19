@@ -1,0 +1,563 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+
+% ─── Code listing style ──────────────────────────────────────────────────────
+\lstdefinestyle{cstyle}{
+  language=C,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue}\bfseries,
+  commentstyle=\color{gray}\itshape,
+  stringstyle=\color{red},
+  numberstyle=\tiny\color{gray},
+  numbers=left,
+  stepnumber=1,
+  frame=single,
+  breaklines=true,
+  captionpos=b,
+  tabsize=4,
+  showstringspaces=false
+}
+
+\begin{document}
+
+% ─── TITLE ───────────────────────────────────────────────────────────────────
+\title{Row-Major vs Column-Major Array Traversal in C:\\
+An Experimental Analysis of Cache Miss Impact on CPU Performance}
+
+\author{
+  \IEEEauthorblockN{Thed Arthur TOKO DIKONGUE}
+  \IEEEauthorblockA{
+    \textit{Student at ISTY - Versailles Saint-Quentin-en-Yvelines University} \\
+    Vélizy-Vllacoublay \\
+    thdarthur@gmail.com
+  }
+}
+
+\maketitle
+
+% ─── ABSTRACT ────────────────────────────────────────────────────────────────
+\begin{abstract}
+This paper presents an experimental study on the performance impact of memory
+access patterns in C programs, with a specific focus on two-dimensional array
+traversal. We demonstrate, through reproducible benchmarks and hardware
+performance counters, that iterating a matrix with the column index in the outer
+loop---i.e., \texttt{tab[j][i]} with \texttt{j} as the outer loop---results in
+significant performance degradation compared to row-major traversal
+(\texttt{tab[i][j]}, \texttt{i} outer). Experiments were conducted on an AMD
+Ryzen 7 3700U (Zen+, x86-64, Ubuntu Linux) using GCC at \texttt{-O2}
+optimization level. Results from \texttt{perf stat} hardware counters show that
+column-major traversal generates approximately \textbf{20$\times$ more cache
+misses} than row-major traversal, with a cache miss rate of 29.65\% versus
+7.60\%, translating into a \textbf{3.7$\times$ slowdown} on a $4096 \times
+4096$ integer matrix (64~MB). Static and dynamic analysis using MAQAO OneView
+further reveals that the column-major inner loop achieves only 33\%
+vectorization coverage versus 100\% for the row-major case, and an Array Access
+Efficiency of 51.1\% versus 100\%, confirming that strided memory access
+prevents effective SIMD utilization. This work provides a concrete,
+hardware-validated demonstration of spatial locality principles, intended as
+both a pedagogical reference and a practical guide for performance-sensitive
+C and C++ development.
+\end{abstract}
+
+\begin{IEEEkeywords}
+cache miss, spatial locality, memory access patterns, row-major order,
+column-major order, CPU performance, SIMD vectorization, AMD Zen+,
+hardware performance counters, MAQAO
+\end{IEEEkeywords}
+
+% ─── 1. INTRODUCTION ─────────────────────────────────────────────────────────
+\section{Introduction}
+
+Modern processors achieve high throughput largely through a multi-level cache
+hierarchy (L1, L2, L3) that bridges the latency gap between the CPU core and
+main memory (DRAM). The fundamental unit of data transfer between memory and
+cache is the \textit{cache line}---typically 64 bytes on x86-64
+architectures---meaning that even a single-byte read triggers a 64-byte
+transfer from the next memory level.
+
+Two-dimensional arrays in C are laid out in memory using \textit{row-major
+order}: elements of the same row are stored at consecutive memory addresses.
+When a program accesses \texttt{tab[i][j]} with \texttt{j} varying fastest
+(the inner loop), the CPU reads consecutive memory locations, exploiting the
+spatial locality principle. Conversely, when \texttt{j} is the outer loop and
+\texttt{i} varies fastest in the inner loop, each successive access is
+separated by $N \times \texttt{sizeof(int)}$ bytes, potentially causing a
+cache miss on every access once the matrix exceeds the cache size.
+
+This phenomenon is well-known in the computer architecture
+literature~\cite{hennessy2017}, yet concrete, hardware-validated demonstrations
+combining timing benchmarks, hardware counters, and static analysis tools remain
+scarce in accessible form. This paper fills that gap by providing:
+
+\begin{itemize}
+  \item A reproducible C benchmark measuring both access patterns across seven
+        matrix sizes from $64 \times 64$ to $4096 \times 4096$;
+  \item Hardware performance counter measurements via Linux \texttt{perf stat},
+        quantifying cache misses at the L1 and LLC levels;
+  \item Static and dynamic analysis via MAQAO OneView, exposing vectorization
+        degradation and array access efficiency caused by strided memory access;
+  \item A comparative analysis across two compiler optimization levels
+        (\texttt{-O0} and \texttt{-O2}).
+\end{itemize}
+
+The remainder of this paper is organized as follows.
+Section~\ref{sec:bg} presents theoretical background on cache hierarchy and
+spatial locality. Section~\ref{sec:setup} describes the experimental setup.
+Section~\ref{sec:results} presents timing results. Section~\ref{sec:perf}
+analyzes hardware counters. Section~\ref{sec:maqao} details MAQAO findings.
+Section~\ref{sec:discussion} discusses implications, and
+Section~\ref{sec:conclusion} concludes.
+
+% ─── 2. BACKGROUND ───────────────────────────────────────────────────────────
+\section{Theoretical Background}
+\label{sec:bg}
+
+\subsection{CPU Cache Hierarchy}
+
+Contemporary x86-64 processors implement a multi-level cache hierarchy to
+mitigate the latency disparity between processing units and DRAM. On the AMD
+Ryzen 7 3700U used in this study:
+
+\begin{itemize}
+  \item \textbf{L1 data cache}: 32~KB per core, latency $\approx$4 cycles
+  \item \textbf{L1 instruction cache}: 64~KB per core
+  \item \textbf{L2 cache}: 512~KB per core (private), latency $\approx$12 cycles
+  \item \textbf{L3 cache (LLC)}: 4~MB shared, latency $\approx$40 cycles
+  \item \textbf{Main memory (DRAM)}: 5795~MB, latency $\approx$200--300 cycles
+\end{itemize}
+
+The ratio of cache hit latency to DRAM latency is typically 50:1 to 100:1.
+A program generating frequent DRAM accesses due to cache misses therefore
+experiences severe throughput degradation regardless of computational complexity.
+
+\subsection{Cache Lines and Spatial Locality}
+
+When the CPU accesses a memory address not present in any cache level (a
+\textit{cache miss}), it fetches an entire cache line of 64 bytes---equivalent
+to 16 consecutive 32-bit integers---from the next level. This mechanism
+exploits \textit{spatial locality}: the empirical observation that programs
+tend to access memory addresses proximate to recently accessed
+ones~\cite{denning2005}.
+
+For a C array \texttt{int tab[N][N]}, the element \texttt{tab[i][j]} resides
+at address:
+
+\begin{equation}
+  \text{addr}(\texttt{tab[i][j]}) = \text{base} + (i \cdot N + j) \cdot
+  \texttt{sizeof(int)}
+  \label{eq:addr}
+\end{equation}
+
+\subsection{Access Pattern Analysis}
+
+\textbf{Row-major traversal} (\texttt{j} inner): consecutive values of
+\texttt{j} produce addresses differing by exactly 4 bytes. Accessing
+\texttt{tab[i][0]} through \texttt{tab[i][15]} loads 16 integers from a single
+cache line after one miss---a theoretical miss rate of $1/16 = 6.25\%$.
+
+\textbf{Column-major traversal} (\texttt{i} inner): consecutive values of
+\texttt{i} produce addresses differing by $N \times 4$ bytes. For $N = 4096$,
+this stride equals 16,384 bytes---256 cache lines apart. Each inner loop
+iteration accesses a cache line unlikely to be resident, producing a miss on
+virtually every access.
+
+Table~\ref{tab:miss_theory} summarizes the theoretical miss rates.
+
+\begin{table}[H]
+\caption{Theoretical Cache Miss Rate Analysis ($N = 4096$, 32-bit integers)}
+\label{tab:miss_theory}
+\centering
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Pattern} & \textbf{Inner} & \textbf{Stride} &
+\textbf{Miss/N} & \textbf{Miss rate} \\
+\midrule
+Row-major    & \texttt{j} & 4~B      & 1  & $\sim$6.25\% \\
+Column-major & \texttt{i} & 16,384~B & 16 & $\sim$100\%  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ─── 3. EXPERIMENTAL SETUP ───────────────────────────────────────────────────
+\section{Experimental Setup and Environment}
+\label{sec:setup}
+
+\subsection{Hardware Environment}
+
+The experiments were conducted on a machine equipped with an AMD Ryzen 7 3700U
+processor (Zen+ microarchitecture, 14nm, 4 physical cores / 8 threads via SMT).
+Fig.~\ref{fig:lstopo} shows the full memory topology as reported by
+\texttt{lstopo}.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.85\columnwidth]{lstopo.png}
+  \caption{Hardware memory topology (lstopo): AMD Ryzen 7 3700U, 4 cores,
+           L1d 32~KB, L2 512~KB per core, L3 4~MB shared, 5795~MB RAM.}
+  \label{fig:lstopo}
+\end{figure}
+
+Each core has a private 32~KB L1 data cache, a 64~KB L1 instruction cache, and
+a private 512~KB L2 cache. All four cores share a single 4~MB L3 (LLC). The
+cache line size is 64~bytes (\texttt{clflush size: 64} in
+\texttt{/proc/cpuinfo}). Total system RAM is 5795~MB on a single NUMA node.
+
+\begin{table}[H]
+\caption{Experimental Environment Summary}
+\label{tab:env}
+\centering
+\begin{tabular}{ll}
+\toprule
+\textbf{Component} & \textbf{Specification} \\
+\midrule
+CPU            & AMD Ryzen 7 3700U (Zen+, 4C/8T, 2.3~GHz) \\
+L1d / L1i      & 32~KB / 64~KB per core \\
+L2             & 512~KB per core (private) \\
+L3 (LLC)       & 4~MB shared \\
+Cache line     & 64~bytes \\
+RAM            & 5795~MB (single NUMA node) \\
+OS             & Ubuntu Linux (kernel 6.x) \\
+Compiler       & GCC (\texttt{-O0} and \texttt{-O2}) \\
+Profiler       & Linux \texttt{perf} v6.17.13 \\
+Analyzer       & MAQAO OneView \\
+Timing         & \texttt{clock\_gettime(CLOCK\_MONOTONIC)} \\
+Runs / size    & 5 (mean reported) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Benchmark Implementation}
+
+Two traversal functions were implemented to isolate the effect of loop ordering.
+Both apply the \texttt{sin()} function to each element, preventing dead code
+elimination while introducing a realistic floating-point workload.
+
+\begin{lstlisting}[style=cstyle, caption={Row-major traversal (cache-friendly)},
+label={lst:row}]
+void row_comp(int *mat, double *res, int size) {
+    for (int i = 0; i < size; i++)
+        for (int j = 0; j < size; j++)
+            res[i*size + j] = sin(mat[i*size + j]);
+}
+\end{lstlisting}
+
+\begin{lstlisting}[style=cstyle,
+caption={Column-major traversal (cache-unfriendly)}, label={lst:col}]
+void column_comp(int *mat, double *res, int size) {
+    for (int j = 0; j < size; j++)
+        for (int i = 0; i < size; i++)
+            res[i*size + j] = sin(mat[i*size + j]);
+}
+\end{lstlisting}
+
+Matrices are heap-allocated via \texttt{malloc}. Values are initialized with
+\texttt{rand() \% 10}. The only structural difference between the two functions
+is the order of the outer and inner loop indices.
+
+\subsection{Matrix Sizes Tested}
+
+\begin{table}[H]
+\caption{Matrix Sizes and Cache Pressure}
+\label{tab:sizes}
+\centering
+\begin{tabular}{ccl}
+\toprule
+\textbf{N} & \textbf{Size} & \textbf{Cache pressure} \\
+\midrule
+64   & 16~KB  & Fits entirely in L1d     \\
+128  & 62~KB  & Fits in L2               \\
+256  & 256~KB & At L2 boundary           \\
+512  & 1~MB   & Between L2 and L3        \\
+1024 & 4~MB   & At LLC boundary          \\
+2048 & 16~MB  & Exceeds LLC              \\
+4096 & 64~MB  & Full RAM access required \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ─── 4. BENCHMARK RESULTS ────────────────────────────────────────────────────
+\section{Benchmark Results}
+\label{sec:results}
+
+\subsection{Execution Time}
+
+Fig.~\ref{fig:comparison} shows mean execution time as a function of matrix
+size for both access patterns and both optimization levels.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\columnwidth]{comparison_O0_O2.png}
+  \caption{Execution time (ms) vs. matrix size $N$: row-major vs. column-major,
+           \texttt{-O0} and \texttt{-O2} (AMD Ryzen 7 3700U, 5 runs each).}
+  \label{fig:comparison}
+\end{figure}
+
+The divergence between access patterns begins at $N = 1024$ (4~MB, at the LLC
+boundary) and increases monotonically. At $N = 4096$, the column-major pattern
+is \textbf{3.1$\times$ slower} under \texttt{-O2} and \textbf{2.6$\times$
+slower} under \texttt{-O0}. Fig.~\ref{fig:ratio} shows the slowdown ratio
+explicitly.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\columnwidth]{ratio_col_over_row.png}
+  \caption{Column-major slowdown ratio relative to row-major. The cache
+           saturation threshold at $N = 1024$ (LLC = 4~MB) is clearly visible.}
+  \label{fig:ratio}
+\end{figure}
+
+\subsection{Raw Timing Data}
+
+\begin{table}[H]
+\caption{Mean Execution Times, \texttt{-O2} (ms), AMD Ryzen 7 3700U}
+\label{tab:results_o2}
+\centering
+\begin{tabular}{ccccc}
+\toprule
+\textbf{N} & \textbf{Size} & \textbf{Row (ms)} & \textbf{Col (ms)} &
+\textbf{Ratio} \\
+\midrule
+64   & 16~KB  & 0.140  & 0.111  & 0.79 \\
+128  & 62~KB  & 0.578  & 0.472  & 0.82 \\
+256  & 256~KB & 2.121  & 1.728  & 0.81 \\
+512  & 1~MB   & 8.368  & 7.017  & 0.84 \\
+1024 & 4~MB   & 37.46  & 49.25  & 1.31 \\
+2048 & 16~MB  & 138.6  & 235.9  & 1.70 \\
+4096 & 64~MB  & 551.1  & 1701.2 & 3.09 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ─── 5. HARDWARE COUNTER ANALYSIS ────────────────────────────────────────────
+\section{Hardware Performance Counter Analysis}
+\label{sec:perf}
+
+Linux \texttt{perf stat} was used to collect hardware performance counters for
+both patterns on a $4096 \times 4096$ matrix under \texttt{-O2}. Separate
+binaries were used per pattern to isolate readings.
+
+\begin{table}[H]
+\caption{\texttt{perf stat} Results, $N = 4096$, \texttt{-O2}}
+\label{tab:perf}
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Counter} & \textbf{row\_comp} & \textbf{column\_comp} \\
+\midrule
+Cache misses         & 1,904,790    & 37,279,590    \\
+Cache references     & 25,057,659   & 125,749,082   \\
+L1 load misses       & 9,290,356    & 40,823,961    \\
+Miss rate            & 7.60\%       & 29.65\%       \\
+Elapsed time         & 552~ms       & 2034~ms       \\
+\midrule
+\textbf{Miss ratio (col/row)} &
+\multicolumn{2}{c}{\textbf{$\approx$20$\times$}} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Column-major traversal generates \textbf{20$\times$ more cache misses} than
+row-major traversal. The L1 load miss count increases by a factor of 4.4, and
+the cache miss rate rises from 7.60\% to 29.65\%, confirming that the CPU
+fetches data from higher memory levels on nearly one in three accesses. The
+elapsed time ratio (3.7$\times$) is lower than the miss ratio (20$\times$)
+because the \texttt{sin()} computation partially hides memory latency through
+out-of-order execution in the row-major case.
+
+% ─── 6. MAQAO ANALYSIS ───────────────────────────────────────────────────────
+\section{MAQAO Static and Dynamic Analysis}
+\label{sec:maqao}
+
+\subsection{Methodology}
+
+MAQAO OneView was used to perform combined static (CQA) and dynamic (LProf)
+analysis~\cite{maqao}. Two separate runs were conducted---one per access
+pattern---to obtain isolated per-function metrics.
+
+\subsection{Global Metrics}
+
+Fig.~\ref{fig:maqao_global_col} and Fig.~\ref{fig:maqao_global_row} show the
+Global Metrics panels for \texttt{column\_comp} and \texttt{row\_comp}
+respectively.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.85\columnwidth]{maqao_global_col.png}
+  \caption{MAQAO Global Metrics --- \texttt{column\_comp}:
+           Total Time 11.24~s, Array Access Efficiency \textbf{51.1\%}.}
+  \label{fig:maqao_global_col}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.85\columnwidth]{maqao_global_row.png}
+  \caption{MAQAO Global Metrics --- \texttt{row\_comp}:
+           Total Time 4.25~s, Array Access Efficiency \textbf{100\%}.}
+  \label{fig:maqao_global_row}
+\end{figure}
+
+The \textit{Array Access Efficiency} metric directly quantifies memory access
+quality: MAQAO reports \textbf{100\%} for \texttt{row\_comp} and \textbf{51.1\%}
+for \texttt{column\_comp}, confirming that nearly half of all memory bandwidth
+is wasted in the column-major case.
+
+\subsection{Expert Summary --- Loop Analysis}
+
+Fig.~\ref{fig:maqao_loops_col} and Fig.~\ref{fig:maqao_loops_row} show the
+Expert Summary loop tables for each pattern.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\columnwidth]{maqao_loops_col.png}
+  \caption{MAQAO Expert Summary --- \texttt{column\_comp} (Loop 3,
+           benchmark.c:14--15): 36.84\% app. coverage, 33.33\% vectorization.}
+  \label{fig:maqao_loops_col}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\columnwidth]{maqao_loops_row.png}
+  \caption{MAQAO Expert Summary --- \texttt{row\_comp} (Loop 2,
+           benchmark.c:8--9): 2.24\% app. coverage, 100\% vectorization.}
+  \label{fig:maqao_loops_row}
+\end{figure}
+
+\subsection{Quantitative Comparison}
+
+\begin{table}[H]
+\caption{MAQAO OneView Metrics Comparison, $N = 4096$, \texttt{-O2}}
+\label{tab:maqao}
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Metric} & \textbf{row\_comp} & \textbf{column\_comp} \\
+\midrule
+Coverage (\% app. time)         & 2.24\%       & 36.84\%       \\
+Vectorization ratio (\%)        & 100\%        & 33.33\%       \\
+Vector length use (\%)          & 41.67\%      & 29.17\%       \\
+Array Access Efficiency (\%)    & \textbf{100} & \textbf{51.1} \\
+Total time (s)                  & 4.25         & 11.24         \\
+CQA speedup if fully vectorized & 2.93$\times$ & 7.71$\times$  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The coverage metric is the most striking result: \texttt{column\_comp} consumes
+\textbf{36.84\%} of total application time versus \textbf{2.24\%} for
+\texttt{row\_comp}---a 16$\times$ difference directly attributable to cache
+miss stalls. The vectorization ratio drops from 100\% to 33\%: GCC generates
+packed AVX instructions (\texttt{VMOVUPD}, \texttt{VINSERTF128}) for the
+row-major loop but cannot apply these to non-contiguous strided accesses. This
+explains the potential speedup of 7.71$\times$ if fully vectorized---the
+column-major loop leaves substantial SIMD performance unrealized.
+
+% ─── 7. DISCUSSION ───────────────────────────────────────────────────────────
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{Cache Saturation Threshold}
+
+Results identify a clear \textit{cache saturation threshold} at $N = 1024$
+(4~MB), coinciding exactly with the LLC size of the Ryzen 7 3700U. Below this
+threshold, the Zen+ hardware prefetcher compensates for the strided access
+pattern---it detects the regular stride and preloads cache lines proactively,
+making column-major paradoxically faster. Above the LLC boundary, the prefetcher
+cannot keep up with demand and cache miss penalties dominate.
+
+\subsection{Compiler Behavior}
+
+Even under \texttt{-O2}, GCC does not automatically perform loop interchange to
+transform column-major access into row-major order. This transformation is only
+legal when loop iterations are provably independent. The programmer bears
+primary responsibility for access pattern design.
+
+\subsection{Compounding Effect: Vectorization Loss}
+
+Beyond cache misses, the MAQAO analysis reveals that the strided access pattern
+also degrades SIMD vectorization: the vectorization ratio drops from 100\% to
+33\%, and Array Access Efficiency from 100\% to 51.1\%. This compounds the
+performance penalty beyond what cache miss counts alone would predict.
+
+\subsection{Practical Implications}
+
+\begin{itemize}
+  \item Always iterate C arrays in row-major order (\texttt{j} as inner loop);
+  \item When column access is required by algorithm logic, consider transposing
+        the matrix before the hot loop;
+  \item The penalty is negligible for matrices fitting in L2 but severe beyond
+        the LLC boundary;
+  \item Modern prefetchers (Zen+, Apple M-series) partially compensate for
+        small working sets but cannot eliminate the penalty at scale.
+\end{itemize}
+
+% ─── 8. CONCLUSION ───────────────────────────────────────────────────────────
+\section{Conclusion}
+\label{sec:conclusion}
+
+This paper provided a hardware-validated, end-to-end experimental demonstration
+of cache miss impact induced by column-major array traversal in C. Using timing
+benchmarks, Linux \texttt{perf} hardware counters, and MAQAO static/dynamic
+analysis on an AMD Ryzen 7 3700U, we showed that:
+
+\begin{itemize}
+  \item Column-major traversal generates \textbf{20$\times$ more cache misses}
+        than row-major for a $4096 \times 4096$ matrix;
+  \item This translates into a \textbf{3.7$\times$ execution time slowdown};
+  \item Vectorization ratio drops from 100\% to 33\%, and Array Access
+        Efficiency from 100\% to 51.1\%, revealing a compounding degradation;
+  \item A clear cache saturation threshold exists at the LLC boundary (4~MB),
+        below which the hardware prefetcher masks the effect.
+\end{itemize}
+
+Future work could extend this study to multi-threaded contexts (OpenMP), GPU
+memory coalescing (CUDA), tiled matrix traversal as mitigation, and comparisons
+across multiple microarchitectures (Intel Alder Lake, ARM Cortex-A).
+
+% ─── REFERENCES ──────────────────────────────────────────────────────────────
+\begin{thebibliography}{00}
+
+\bibitem{hennessy2017}
+J.~L. Hennessy and D.~A. Patterson,
+\textit{Computer Architecture: A Quantitative Approach}, 6th~ed.
+Morgan Kaufmann, 2017.
+
+\bibitem{denning2005}
+P.~J. Denning,
+``The locality principle,''
+\textit{Communications of the ACM}, vol.~48, no.~7, pp.~19--24, Jul. 2005.
+
+\bibitem{drepper2007}
+U.~Drepper,
+``What every programmer should know about memory,''
+\textit{Red Hat, Inc.}, Tech. Rep., 2007. [Online]. Available:
+\url{https://people.freebsd.org/~lstewart/articles/cpumemory.pdf}
+
+\bibitem{maqao}
+D.~Barthou \textit{et al.},
+``MAQAO: Modular assembler quality analyzer and optimizer for Itanium-2,''
+in \textit{Proc. Int. Conf. on High Performance Computing}, 2005.
+
+\bibitem{fog2023}
+A.~Fog,
+``Optimizing software in C++: An optimization guide for Windows, Linux,
+and Mac platforms,'' Tech. Rep., 2023. [Online]. Available:
+\url{https://www.agner.org/optimize/}
+
+\end{thebibliography}
+
+\end{document}
